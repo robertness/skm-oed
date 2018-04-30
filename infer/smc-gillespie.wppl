@@ -1,0 +1,297 @@
+// (local-set-key (kbd "s-r") (lambda () (interactive) (save-buffer) (process-send-string "*shell skm-oed*" "echo '\n'; make smc-gillespie.wppl.js && time node smc-gillespie.wppl.js\n")))
+
+// versions of functional helpers that take lists as first arg rather than second
+var _map = function(xs, f) { return map(f, xs) }
+var _map2 = function(xs, ys, f) { return map2(f, xs, ys) }
+var _mapIndexed = function(xs, f) { return mapIndexed(f, xs) }
+var _filter = function(xs, f) { return filter(f, xs) }
+
+var round3 = function(x) {
+  return Math.round(x * 1000)/1000;
+}
+
+var mean = function(xs) {
+  sum(xs) / xs.length
+}
+
+// add two arrays
+var listAdd = function(xs, ys) {
+  map2(function(x, y) { return x + y }, xs, ys)
+}
+
+// C(n,k) = n! / (k! * (n-k)!)
+var choose = function(n,k) {
+  // optimizations for common cases
+  if (k == 0) { return 1 }
+  if (k == 1) { return n }
+  if (n < k) { return 0 }
+  var botMax = ((k > n-k) ? k : n-k);
+  var botMin = ((k > n-k) ? n-k : k);
+  var top = _.range(botMax+1, n+1)
+  var bot = _.range(1, botMin + 1);
+  return product(top)/product(bot)
+}
+
+
+var speciesNames = ["codY",
+                    "CodY",
+                    "flache",
+                    "SigD",
+                    "SigD_hag",
+                    "hag",
+                    "Hag",
+                    "CodY_flache",
+                    "CodY_hag"
+                   ];
+
+var numSpecies = speciesNames.length
+var speciesNums = _.range(numSpecies)
+
+var initialState = [1, 0, 1, 0, 0, 1, 0, 0, 0];
+var vInitialState = Vector(initialState);
+
+
+// input: a species name
+// output: a corresponding one-hot vector
+var speciesOneHot = cache(function(sp) {
+  return _map(speciesNames,
+              function(name) { return name == sp ? 1 : 0})
+})
+
+// input: a list of species
+// output: a vector of species counts
+var speciesListOneHots = function(species) {
+  return reduce(
+    function(sp, acc) {
+      return listAdd(acc, speciesOneHot(sp))
+    },
+    speciesOneHot('dummy'),
+    species
+  )
+};
+
+var lawStrings = [
+  "codY -> codY + CodY",
+  "CodY -> ∅",
+  "flache -> flache + SigD",
+  "SigD -> ∅",
+  "SigD_hag -> SigD + hag + Hag",
+  "Hag -> ∅",
+  "SigD + hag -> SigD_hag",
+  "SigD_hag -> SigD + hag",
+  "CodY + flache -> CodY_flache",
+  "CodY_flache -> CodY + flache",
+  "CodY + hag -> CodY_hag",
+  "CodY_hag -> CodY + hag"
+];
+
+var numLaws = lawStrings.length;
+var lawNums = _.range(numLaws);
+
+// convert string representation of laws into reactant, product, and stoichiometry matrices
+var lawStringsSplit = _map(lawStrings,
+                           function(str) { return str.split(/ *-> */g )})
+var lawInputStrings = _map(_.map(lawStringsSplit,'0'), function(str) { return str.split(/ +/g) })
+var lawOutputStrings = _map(_.map(lawStringsSplit,'1'), function(str) { return str.split(/ +/g) })
+
+var lawInputs = map(speciesListOneHots, lawInputStrings)
+var lawOutputs = map(speciesListOneHots, lawOutputStrings)
+
+var laws = _map2(lawInputs,
+                 lawOutputs,
+                 function(input, output) {
+                   var negInput = _map(input, function(x) { return x * -1})
+                   return listAdd(negInput, output)
+                 })
+var vLaws = _map(laws, function(law) { return Vector(law) });
+
+var kProtDeg = 0.0002
+var kCodOn = 0.02 // assumed to be unknown in wilkinson paper
+var kCodOff = 0.1 // assumed to be unknown in wilkinson paper
+var kProdSigD = 1 // assumed to be unknown in wilkinson paper
+var trueRates = [0.1,
+                 kProtDeg,
+                 kProdSigD,
+                 kProtDeg,
+                 1,
+                 kProtDeg,
+                 0.01,
+                 0.1,
+                 kCodOn,
+                 kCodOff,
+                 0.01,
+                 0.1]
+
+var ratePriorDists = [Delta({v: 0.1}),
+                      Delta({v: kProtDeg}),
+
+                      // law whose rate is kProdSigD
+                      // mean                | 3.2
+                      // mode                | 2.4
+                      // standard deviation  | 1.6
+                      // variance            | 2.56
+                      // skewness            | 1
+                      Gamma({shape: 4, scale: 0.8}),
+
+                      Delta({v: kProtDeg}),
+                      Delta({v: 1}),
+                      Delta({v: kProtDeg}),
+                      Delta({v: 0.01}),
+                      Delta({v: 0.1}),
+
+                      // law whose rate is kCodOn
+                      // mean                | 0.4
+                      // mode                | 0.2
+                      // standard deviation  | 0.282843
+                      // variance            | 0.08
+                      // skewness            | sqrt(2)≈1.41421
+                      Gamma({shape: 2, scale: 0.2}),
+
+                      // law whose rate is kCodOff
+                      // mean                | 1.
+                      // mode                | 0.5
+                      // standard deviation  | 0.707107
+                      // variance            | 0.5
+                      // skewness            | sqrt(2)≈1.41421
+                      Gamma({shape: 2, scale: 0.5}),
+
+                      Delta({v: 0.01}),
+                      Delta({v: 0.1})
+                     ]
+
+
+var gillespie = function(vRates, vState, tStart, tEnd) {
+  if (tStart > tEnd) {
+    return []
+  }
+
+  var getGValue = function(i) {
+    var input = lawInputs[i]
+    return product(_map(speciesNums,
+                        function(j) {
+                          var state_j = T.get(vState, j)
+                          var input_j = input[j]
+                          return choose(state_j, input_j)
+                        }))
+  }
+  var gValues = Vector(map(getGValue, lawNums))
+
+  var hazards = T.mul(vRates, gValues),
+      totalHazard = T.sumreduce(hazards);
+  if (totalHazard == 0) {
+    return []
+  }
+  var dtDist = Exponential({a: totalHazard});
+  var dt = sample(dtDist);
+  var lawDist = Discrete({ps: hazards});
+  var lawNum = sample(lawDist);
+
+  var stateUpdate = vLaws[lawNum];
+  var newState = T.add(vState, stateUpdate);
+
+  var jump = {
+    //dt: dt,
+    t: tStart + dt,
+    lawNum: lawNum,
+    state: newState
+    //prevState: vState,
+    //gValues: gValues
+  }
+
+  return [jump].concat(gillespie(vRates, newState, tStart + dt, tEnd))
+}
+
+
+//var actualMeasurement = Vector([ 1, 1, 1, 4, 0, 1, 0, 0, 0 ]);
+
+var errorDist = MultivariateGaussian({mu: zeros([numSpecies, 1]),
+                                      cov: T.mul(idMatrix(numSpecies), 100)
+                                     })
+
+
+// var rates = _map(ratePriorDists,
+//                  function(dist) {
+//                    if (_.has(dist.params, 'v')) {
+//                      return dist.params.v
+//                    } else {
+//                      return sample(dist)
+//                    }
+//                  })
+
+var global_tEnd = 300;
+
+var estimateLikelihoodFwd = function(rates, actualMeasurement) {
+  var n = 50;
+  var trajs = helper.nGillespie(n, rates, initialState, 0, global_tEnd, lawInputs, laws);
+  var lls = _map(trajs,
+                 function(traj) {
+                   var sm = _.last(traj).state
+                   var score = errorDist.score(T.sub(actualMeasurement, sm))
+                   return score
+                 })
+  return numeric._logsumexp(lls) - Math.log(n)
+}
+
+var estimateLikelihood = function(vRates, actualMeasurement) {
+  var model = function() {
+    var traj = gillespie(vRates, vInitialState, 0, global_tEnd);
+    var sampledMeasurement = _.last(traj).state
+    //console.log(T.toScalars(sampledMeasurement), round3(errorDist.score(T.sub(actualMeasurement, sampledMeasurement))))
+    observe(errorDist, T.sub(actualMeasurement, sampledMeasurement))
+    var trajString = _map(traj, function(jump) { return jump.t + ',' + jump.lawNum }).join(';');
+    var trajHash = crypto.createHash('md5').update(trajString).digest('hex');
+    return {hash: trajHash,
+            lastState: T.toScalars(_.last(traj).state),
+            score: errorDist.score(T.sub(actualMeasurement, sampledMeasurement))
+           }
+  }
+  var post = Infer({
+    //method: 'PMCMC', particles: 10, sweeps: 2,
+    method: 'SMC', particles: 20,
+    model: model
+  })
+  //display(post.support().length)
+  return post.normalizationConstant
+}
+
+// TODO: drift kernels
+var parameterInference = function(actualMeasurement) {
+  var model = function() {
+    var rates = _map(ratePriorDists,
+                     function(dist) {
+                       if (_.has(dist.params, 'v')) {
+                         return dist.params.v
+                       } else {
+                         return sample(dist)
+                       }
+                     })
+    var vRates = Vector(rates);
+
+
+    factor(estimateLikelihoodFwd(rates, actualMeasurement))
+
+    var ret = [rates[2],rates[8],rates[9]]
+    //console.log(map(function(x) { ad.value(x) }, ret))
+
+    return ret
+  }
+  return Infer({model: model,
+                method: 'MCMC',
+                samples: 100,
+                verbose: true
+               })
+}
+
+
+util.seedRNG(2)
+var actualMeasurement = _.last(gillespie(Vector(trueRates), vInitialState, 0, global_tEnd)).state
+// console.log(T.toScalars(actualMeasurement))
+util.seedRNG(7)
+var r = [estimateLikelihoodFwd(trueRates, actualMeasurement),
+         estimateLikelihood(Vector(trueRates), actualMeasurement)
+        ]
+r
+
+
+//parameterInference(actualMeasurement)
+//display(actualMeasurement)

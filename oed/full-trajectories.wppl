@@ -1,0 +1,663 @@
+// OED for wilkinson motility model assuming full noiseless trajectories
+// this file contains two methods for calculating EIG:
+// - EIGAnalytic: an analytic approach that exploits gamma conjugacy and closed form solution for KL between
+// - EIG: a more general empirical approach that computes the difference of log likelihood under posterior
+// and likelihood under posterior. this is equivalent to expected KL but takes a tiny bit of math to derive.
+
+// (local-set-key (kbd "s-r") (lambda () (interactive) (save-buffer) (process-send-string "*shell cell-dynamics*" "echo '\n'; webppl full-trajectories.wppl --require ./helper\n")))
+
+"# general utilities"; {
+
+  var round3 = function(x) {
+    return Math.round(x * 1000)/1000;
+  }
+
+  var factorial = dp.cache(function(n) {
+    if (n == 0) {
+      return 1
+    }
+    return n * factorial(n-1)
+  })
+
+  var chooseNaive = function(n,k) {
+    if (n < k) {
+      return 0
+    }
+    return factorial(n) / (factorial(k) * factorial(n-k));
+  };
+
+  var choose = function(n,k) {
+    if (k == 0) {
+      return 1
+    }
+    if (k == 1) {
+      return n
+    }
+    if (n < k) {
+      return 0
+    }
+    var botMax = ((k > n-k) ? k : n-k);
+    var botMin = ((k > n-k) ? n-k : k);
+    var top = _.range(botMax+1, n+1),
+        bot = _.range(1, botMin + 1);
+    return product(top)/product(bot)
+  }
+
+  var _map = function(xs, f) { return map(f, xs) }
+  var _map2 = function(xs, ys, f) { return map2(f, xs, ys) }
+  var _mapIndexed = function(xs, f) { return mapIndexed(f, xs) }
+  var _filter = function(xs, f) { return filter(f, xs) }
+
+  var vAdd = function(xs, ys) {
+    map2(function(x, y) { return x + y }, xs, ys)
+  }
+
+  var vNeg = function(xs) {
+    return _map(xs, function(x) { x * -1})
+  }
+
+  var compactTrajectory = function(traj) {
+    return _.map(traj, 'lawNum').join('')
+  }
+
+  // sample and score
+  var ss = function(dist) {
+    var x = sample(dist);
+    return _.extend(x, {score: dist.score(x)})
+  }
+
+  var KL = function(P, Q, pProp) {
+    var statesP = P.support();
+    var statesQ = Q.support();
+
+    // TODO: assert that states1 = states2
+    return sum(map(
+      function(state) {
+        var scoreP = P.score(state);
+        var scoreQ = Q.score((!!pProp) ? state[pProp] : state);
+        var probP = Math.exp(scoreP);
+        // P(i) * log[ P(i) / Q(i) ] =  P(i) * [log(P(i) - log(Q(i)))]
+        // Let \lim_{x \to 0} x \log(x) = 0.
+        // Otherwise, 0 * -Infinity = NaN.
+        if (probP === 0) {
+          return 0;
+        }
+        return probP * (scoreP - scoreQ);
+      },
+      statesP));
+  }
+
+  var mean = function(xs) {
+    return sum(xs)/xs.length
+  }
+
+  var variance = function(erp) {
+    var mean = expectation(erp)
+
+    sum(map(function(state) { return Math.exp(erp.score(state)) * (state - mean)*(state-mean) },
+            erp.support()))
+  }
+
+  var estimateKL2 = function(prior, posterior) {
+    var n = 312345
+    mean(repeat(n,
+                function() {
+                  var x = sample(posterior);
+                  var priorScore = prior.score(x),
+                  posteriorScore = posterior.score(x);
+
+                  return posteriorScore - priorScore;
+
+                }
+               ))
+  }
+
+  var gammaCof = [
+    76.18009172947146,
+    -86.50532032941677,
+    24.01409824083091,
+    -1.231739572450155,
+    0.1208650973866179e-2,
+    -0.5395239384953e-5];
+
+  var logGamma = function(xx) {
+    var x = xx - 1.0;
+    var _tmp = x + 5.5;
+    var tmp = _tmp - (x + 0.5) * Math.log(_tmp);
+    var ser = 1.000000000190015;
+
+    var serExtra = sum(map(function(i) { gammaCof[i] / (x + i + 1)},
+                           _.range(6)));
+
+    return -tmp + Math.log(2.5066282746310005 * (ser + serExtra));
+  }
+
+  // HT https://en.wikipedia.org/wiki/Digamma_function#Computation_and_approximation
+  var digamma = function(x) {
+    if (x < 6) {
+      return digamma(x + 1) - 1 / x;
+    }
+    return Math.log(x) -
+      1 / (2 * x) -
+      1 / (12 * Math.pow(x, 2)) +
+      1 / (120 * Math.pow(x, 4)) -
+      1 / (252 * Math.pow(x, 6)) +
+      1 / (240 * Math.pow(x, 8)) -
+      5 / (660 * Math.pow(x, 10)) +
+      691 / (32760 * Math.pow(x, 12)) -
+      1 / (12 * Math.pow(x, 14));
+  }
+
+
+}
+
+"# biological definitions and methods"; {
+
+  // var laws = [
+  //   // A -> C
+  //   [-1, 0, 1],
+  //   // B -> C
+  //   [0, -1, 1]
+  // ];
+
+
+  var speciesNames = ["codY",
+                      "CodY",
+                      "flache",
+                      "SigD",
+                      "SigD_hag",
+                      "hag",
+                      "Hag",
+                      "CodY_flache",
+                      "CodY_hag"
+                      ];
+
+  var speciesOneHot = cache(function(sp) {
+    return _map(speciesNames,
+                function(name) { return name == sp ? 1 : 0}
+               )
+  })
+
+  var pureInitialState = [1, 0, 1, 0, 0, 1, 0, 0, 0];
+
+  var lawStrings = [
+    "codY -> codY + CodY",
+    "CodY -> ∅",
+    "flache -> flache + SigD",
+    "SigD -> ∅",
+    "SigD_hag -> SigD + hag + Hag",
+    "Hag -> ∅",
+    "SigD + hag -> SigD_hag",
+    "SigD_hag -> SigD + hag",
+    "CodY + flache -> CodY_flache",
+    "CodY_flache -> CodY + flache",
+    "CodY + hag -> CodY_hag",
+    "CodY_hag -> CodY + hag"
+  ]
+
+  var kProtDeg = 0.0002
+  var kCodOn = 0.02 // unknown
+  var kCodOff = 0.1 // unknown
+  var kProdSigD = 1 // unknown
+  var trueMotilityRates = [0.1,
+                           kProtDeg,
+                           kProdSigD,
+                           kProtDeg,
+                           1,
+                           kProtDeg,
+                           0.01,
+                           0.1,
+                           kCodOn,
+                           kCodOff,
+                           0.01,
+                           0.1]
+
+  var ratePriorDists = [Delta({v: 0.1}),
+                        Delta({v: kProtDeg}),
+
+                        // law whose rate is kProdSigD
+                        // mean                | 3.2
+                        // mode                | 2.4
+                        // standard deviation  | 1.6
+                        // variance            | 2.56
+                        // skewness            | 1
+                        Gamma({shape: 4, scale: 0.8}),
+
+                        Delta({v: kProtDeg}),
+                        Delta({v: 1}),
+                        Delta({v: kProtDeg}),
+                        Delta({v: 0.01}),
+                        Delta({v: 0.1}),
+
+                        // law whose rate is kCodOn
+                        // mean                | 0.4
+                        // mode                | 0.2
+                        // standard deviation  | 0.282843
+                        // variance            | 0.08
+                        // skewness            | sqrt(2)≈1.41421
+                        Gamma({shape: 2, scale: 0.2}),
+
+                        // law whose rate is kCodOff
+                        // mean                | 1.
+                        // mode                | 0.5
+                        // standard deviation  | 0.707107
+                        // variance            | 0.5
+                        // skewness            | sqrt(2)≈1.41421
+                        Gamma({shape: 2, scale: 0.5}),
+
+                        Delta({v: 0.01}),
+                        Delta({v: 0.1})
+                       ]
+
+  var lawStringsSplit = _map(lawStrings,
+                             function(str) {
+                               return str.split(/ *-> */g)
+                             }
+                            )
+  var lawInputStrings = _map(_.map(lawStringsSplit,'0'), function(str) { return str.split(/ +/g) })
+  var lawOutputStrings = _map(_.map(lawStringsSplit,'1'), function(str) { return str.split(/ +/g) })
+
+  var speciesListOneHots = function(species) {
+    return reduce(
+      function(sp, acc) {
+        return vAdd(acc, speciesOneHot(sp))
+      },
+      speciesOneHot('dummy'),
+      species
+    )
+  }
+
+  var lawInputs = map(speciesListOneHots, lawInputStrings)
+  var lawOutputs = map(speciesListOneHots, lawOutputStrings)
+
+  var laws = map2(function(input, output) {
+    var negInput = _map(input, function(x) { return x * -1})
+    return vAdd(negInput, output)
+  },
+                  lawInputs,
+                  lawOutputs
+                 )
+  var vLaws = map(Vector, laws);
+
+  var numLaws = laws.length;
+  var lawNums = _.range(numLaws)
+  var numSpecies = laws[0].length
+  var speciesNums = _.range(numSpecies)
+
+
+  // var abcRatePriorParams = [
+  //   // mean | 0.0297
+  //   // mode | 0.02937
+  //   // standard deviation | 0.00313065
+  //   // variance | 9.801×10^-6
+  //   // skewness | sqrt(2/5)/3≈0.210819
+  //   {shape: 90, scale: 0.00033},
+
+  //   // mean | 0.03
+  //   // mode | 0.02
+  //   // standard deviation | 0.0173205
+  //   // variance | 0.0003
+  //   // skewness | 2/sqrt(3)≈1.1547
+  //   {shape: 3, scale: 0.01}
+  // ];
+
+  // var abcPriorDists = _map(abcRatePriorParams,
+  //                       function(par) { Gamma(par) }
+  //                      )
+
+  var gillespie = function(opts) {
+    var rates = opts.rates, // vector
+        state = opts.state, // must be a vector
+        tStart = opts.tStart,
+        tEnd = opts.tEnd;
+
+    if (tStart > tEnd) {
+      return []
+    }
+
+    var getGValue = function(i) {
+      var input = lawInputs[i]
+      return product(_map(speciesNums,
+                          function(j) {
+                            var state_j = T.get(state, j)
+                            var input_j = input[j]
+                            return choose(state_j, input_j)
+                          }))
+    }
+    var gValues = map(getGValue, lawNums)
+
+    var hazards = map2(function(r,gv) { return r * gv }, rates, gValues),
+        totalHazard = sum(hazards);
+    if (totalHazard == 0) {
+      return []
+    }
+    var dtDist = Exponential({a: totalHazard});
+    var lawDist = Discrete({ps: hazards});
+    var dt = sample(dtDist)
+    var i = sample(lawDist),
+        stateUpdate = vLaws[i];
+
+    var xNew = T.add(state, stateUpdate);
+
+    // console.log(dt, xNew)
+
+    var ret = {dt: dt,
+               t: tStart + dt,
+               lawNum: i,
+               prevState: state,
+               state: xNew,
+               gValues: gValues
+              }
+
+    return [ret].concat(
+      gillespie({rates: rates,
+                 state: xNew,
+                 tStart: tStart + dt,
+                 tEnd: tEnd
+                })
+    )
+  }
+
+  // console.log(_.last(gillespie({rates: trueMotilityRates,
+  //                        state: Vector(pureInitialState),
+  //                        tStart: 0,
+  //                        tEnd: 7200
+  //                              })).state)
+  // process.exit()
+
+  var gillespieScore = function(rates, trajectory) {
+    // TODO: rewrite as a map over the trajectory
+    var helper = function(jumpNum) {
+      if (jumpNum == trajectory.length) {
+        return 0
+      }
+      var jump = trajectory[jumpNum]
+      var state = jump.prevState
+      var getHazard = function(i) {
+        var input = lawInputs[i];
+        return rates[i] * product(_map(speciesNums,
+                                       function(j) {
+                                         var state_j = T.get(state, j)
+                                         var input_j = input[j]
+                                         return choose(state_j, input_j)
+                                       }))
+      }
+      var hazards = map(getHazard, lawNums)
+      var timeScore = Exponential({a: sum(hazards)}).score(jump.dt);
+      var reactionScore = Discrete({ps: hazards}).score(jump.lawNum);
+      var score = timeScore + reactionScore;
+      return score + helper(jumpNum + 1);
+    }
+
+    return helper(0)
+  }
+}
+
+
+//console.log(argv)
+var seed = argv.seed || 1;
+console.log('using seed ' + seed)
+util.seedRNG(seed)
+
+var globalTEnd = 40;
+
+//var ratePriorDists = _map(abcRatePriorParams, function(params) { Gamma(params) });
+
+var sampleRate = function() {
+  return _map(ratePriorDists, function(d) { sample(d) })
+}
+
+var cachedSampleRate = cache(function(i) {
+  return _map(ratePriorDists, function(d) { sample(d) })
+})
+
+
+var sampleTrajectory = function(initialState) {
+  var rates = sampleRate();
+  var trajectory = gillespie({rates: rates,
+                              state: initialState,
+                              tStart: 0,
+                              tEnd: globalTEnd})
+  return trajectory;
+}
+
+var cachedSampleTrajectory = cache(function(initialState) {
+  var rates = sampleRate();
+  var trajectory = gillespie({rates: rates,
+                              state: initialState,
+                              tStart: 0,
+                              tEnd: globalTEnd})
+  return trajectory;
+})
+
+var cachedTrajectoryPrior = cache(function(initialState, n) {
+  var vInitialState = Vector(initialState)
+  var x = _map(_.range(n),
+               function(i) {
+                 var rates = cachedSampleRate(i)
+                 return gillespie({rates: rates,
+                                   state: vInitialState,
+                                   tStart: 0,
+                                   tEnd: globalTEnd})
+               })
+  return x
+  // Infer({
+  //   method: 'enumerate',
+  //   model: function() {
+  //     return uniformDraw(x);
+  //   }
+  // })
+})
+
+
+var EIG = function(type, species, ratePrior) {
+  var initialState = (type == 'ku') ? [species == 'A' ? 300 : 100,
+                                       species == 'B' ? 300 : 100,
+                                       species == 'C' ? 300 : 100]
+  : (type == 'kd') ?  [species == 'A' ? 10 : 100,
+                       species == 'B' ? 10 : 100,
+                       species == 'C' ? 10 : 100]
+  : [species == 'A' ? 0 : 100,
+     species == 'B' ? 0 : 100,
+     species == 'C' ? 0 : 100]
+
+  console.log('knocking ' + {ku: 'up', kd: 'down', ko: 'out'}[type] + ' ' + species + ': ' + initialState )
+
+  var trajectoryPrior = cachedTrajectoryPrior(initialState, 5);
+
+  // calculate KL based on belief update by hand
+
+  // var KLs = Infer({
+  //   method: 'enumerate',
+  //   model: function() {
+  //     var trajectory = sample(trajectoryPrior);
+  //     //var trajectory = cachedSampleTrajectory(initialState)
+  //     //var trajectory = sampleTrajectory(initialState)
+
+  //     var prior = Infer({
+  //       method: 'enumerate',
+  //       model: function() {
+  //         var rates = sample(ratePrior);
+  //         return rates[1];
+  //       }
+  //     })
+
+  //     var posterior = Infer({
+  //       method: 'enumerate',
+  //       model: function() {
+  //         var rates = sample(ratePrior);
+  //         var sk = gillespieScore(rates, trajectory);
+  //         factor(sk)
+  //         return rates;
+  //       }
+  //     })
+
+  //     KL(posterior, ratePrior)
+  //   }
+  // })
+
+  // expectation(KLs)
+
+  // use difference of expectations method
+  var KLs = Infer({
+    method: 'enumerate',
+    model: function() {
+      var trajectory = sample(trajectoryPrior)
+      var steps = 200
+
+      console.log('trajectory is ' + compactTrajectory(trajectory))
+      var eLL = expectation(Infer({
+        method: 'MCMC',
+        kernel: {HMC : { stepSize: 0.003 }},
+        samples: steps,
+        verbose: true,
+        model() {
+          var rate = sampleRate()
+          var LL = gillespieScore(rate, trajectory)
+          //display(rate, LL)
+          factor(LL)
+          return LL
+        }
+      }))
+
+      console.log('done calulating eLL')
+
+      var Zdist = Infer({
+        method: 'MCMC',
+        kernel: {HMC : { stepSize: 0.003 }},
+        samples: steps,
+        verbose: true,
+        model() {
+          var rate = sampleRate()
+          return Math.exp(gillespieScore(rate, trajectory))
+        }
+      })
+      var Z = expectation(Zdist)
+      console.log(eLL, '-', Math.log(Z))
+      return eLL - Math.log(Z)
+
+    }
+  })
+
+  expectation(KLs)
+}
+
+
+var EIGanalytic = function(type, species) {
+  // var initialState = (type == 'ku') ? [species == 'A' ? 300 : 100,
+  //                                     species == 'B' ? 300 : 100,
+  //                                     species == 'C' ? 300 : 100]
+  //     : (type == 'kd') ?  [species == 'A' ? 10 : 100,
+  //                          species == 'B' ? 10 : 100,
+  //                          species == 'C' ? 10 : 100]
+  //     : [species == 'A' ? 0 : 100,
+  //        species == 'B' ? 0 : 100,
+  //        species == 'C' ? 0 : 100]
+
+
+  var stateAdjustment = {
+    kd: vNeg(speciesOneHot(species)),
+    ku: speciesOneHot(species),
+    na: speciesOneHot('dummy')
+  }[type];
+
+  assert.ok(!(_.isUndefined(stateAdjustment)), 'unknown intervention type ' + type)
+
+  // kd: decrement species, ku: increment species
+  var initialState = vAdd(pureInitialState, stateAdjustment)
+
+  console.log('\nknocking ' + {ku: 'up', kd: 'down', ko: 'out'}[type] + ' ' + species + ': ' + initialState )
+
+  var ratePriorNumsToUpdate = _filter(lawNums,
+                                      function(i) {
+                                        var dist = ratePriorDists[i];
+                                        var params = _.keys(dist.params)
+                                        return _.includes(params, 'shape') && _.includes(params, 'scale')
+                                      })
+
+  var conjugacyUpdate = function(parameters, lawNum, trajectory) {
+    var oldParams = parameters,
+        oldShape = parameters.shape,
+        oldScale = parameters.scale,
+        oldRate = 1 / oldScale;
+
+    var numReactions = _.filter(trajectory, {lawNum: lawNum}).length;
+    var integratedGValues = sum(_map(trajectory,
+                                     function(jump) { return jump.dt * jump.gValues[lawNum] }));
+
+    var newShape = oldShape + numReactions;
+    var newRate = oldRate + integratedGValues;
+    var newScale = 1 / newRate;
+
+    return {shape: newShape, scale: newScale}
+  }
+
+  // HT https://arxiv.org/pdf/1401.6853.pdf
+  var gammaKL = function(priorParams, posteriorParams) {
+    // a is scale, d is shape
+
+    var a1 = posteriorParams.scale,
+        d1 = posteriorParams.shape,
+        a2 = priorParams.scale,
+        d2 = priorParams.shape
+
+    var kl = d2 * Math.log(a2) + helper.logGamma(d2) - (d1 * Math.log(a1) + helper.logGamma(d1)) +
+        ((helper.digamma(d1) + Math.log(a1)) * (d1 - d2)) +
+        d1 * (a1/a2) -
+        d1
+    return kl
+  }
+
+  // mercifully, KL is additive
+  // so if we have analytic form of posterior conditional on trajectory
+  // we can calculate KL(overall posterior, overall prior)
+  // as the sum over rate laws i, KL(posterior_i || prior_i)
+
+
+  var t1 = Date.now()
+  var trajectoryPrior = cachedTrajectoryPrior(initialState, 100);
+  console.log(Date.now() - t1)
+
+  _map(ratePriorNumsToUpdate,
+       function(lawNum) {
+         var igDist = Infer({
+           method: 'enumerate',
+           //method: 'MCMC', kernel: 'HMC',
+           model: function() {
+             //var traj = sampleTrajectory(initialState)
+             //var traj = cachedSampleTrajectory(initialState)
+             var traj = uniformDraw(trajectoryPrior);
+             var priorParams = ratePriorDists[lawNum].params
+             var posteriorParams = conjugacyUpdate(priorParams, lawNum, traj);
+             var kl = gammaKL(priorParams, posteriorParams)
+             //console.log(compactTrajectory(traj), priorParams, posteriorParams, kl)
+             return kl
+           }
+         })
+
+         return {lawNum: lawNum,
+                 mean: round3(expectation(igDist)),
+                 var: round3(variance(igDist))}
+       }
+      )
+}
+
+var res = [EIGanalytic("na"),
+           EIGanalytic("kd", 'codY'),
+           EIGanalytic("kd", 'flache'),
+           EIGanalytic("kd", 'hag'),
+           EIGanalytic("ku", 'codY'),
+           EIGanalytic("ku", 'flache'),
+           EIGanalytic("ku", 'hag')]
+
+res
+// var ratePrior = Infer({
+//   method: 'forward',
+//   samples: 400,
+//   model: function() { sampleRate() }
+// })
+
+
+// var empiricalResults = map(round3, [EIG('kd', "A", ratePrior), EIG('kd', "B", ratePrior), EIG('kd', "C", ratePrior)])
+// //console.log(analyticResults)
+// console.log(empiricalResults)
